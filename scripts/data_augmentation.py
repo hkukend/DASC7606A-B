@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import albumentations as A
 from PIL import Image
+from tqdm import tqdm
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +24,8 @@ class ImageAugmenter:
         seed: int = 42,
         save_original: bool = True,
         image_extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg"),
+        output_format: str = "jpg",
+        jpeg_quality: int = 90,
     ):
         """
         Initialize the ImageAugmenter.
@@ -31,11 +35,15 @@ class ImageAugmenter:
             seed: Random seed for reproducibility.
             save_original: Whether to save the original image with prefix 'orig_'.
             image_extensions: Tuple of valid image file extensions.
+            output_format: Image format to save augmented files ('jpg' or 'png').
+            jpeg_quality: JPEG quality (only used when output_format='jpg').
         """
         self.augmentations_per_image = augmentations_per_image
         self.seed = seed
         self.save_original = save_original
         self.image_extensions = image_extensions
+        self.output_format = output_format.lower()
+        self.jpeg_quality = jpeg_quality
 
         self._set_seed()
 
@@ -108,11 +116,26 @@ class ImageAugmenter:
         output_path.mkdir(parents=True, exist_ok=True)
         count = 0
 
+        # Idempotency: if a completion marker exists, skip processing
+        marker = output_path / ".augmentation_done.json"
+        if marker.exists():
+            try:
+                info = json.loads(marker.read_text())
+                logger.info(
+                    "Augmentation already completed previously. "
+                    f"Found marker with settings: {info}. Skipping."
+                )
+                return
+            except Exception:
+                # If marker is unreadable, fall through and regenerate
+                logger.warning("Existing augmentation marker unreadable. Re-running augmentation.")
+
         image_files = self._find_image_files(input_path)
 
         logger.info(f"Found {len(image_files)} images to augment.")
 
-        for img_path in image_files:
+        pbar = tqdm(image_files, desc="Augmenting images", unit="img", leave=True)
+        for img_path in pbar:
             try:
                 image = Image.open(img_path).convert("RGB")
             except Exception as e:
@@ -125,17 +148,46 @@ class ImageAugmenter:
             if not target_dir.exists():
                 target_dir.mkdir(parents=True, exist_ok=True)
 
+            # Determine output extension and save params
+            base = img_path.stem
+            if self.output_format in ("jpg", "jpeg"):
+                out_ext = ".jpg"
+                save_kwargs = {"format": "JPEG", "quality": self.jpeg_quality, "subsampling": 2}
+            else:
+                out_ext = ".png"
+                save_kwargs = {"format": "PNG", "optimize": True}
+
             # Save original if requested
             if self.save_original:
-                orig_name = f"orig_{img_path.name}"
-                image.save(target_dir / orig_name)
+                orig_name = f"orig_{base}{out_ext}"
+                image.save(target_dir / orig_name, **save_kwargs)
+                count += 1
+                pbar.set_postfix({"generated": count})
 
             # Generate and save augmented versions
             for i in range(self.augmentations_per_image):
                 augmented = self.augment_image(image.copy())
-                aug_name = f"aug_{i}_{img_path.name}"
-                augmented.save(target_dir / aug_name)
+                aug_name = f"aug_{i}_{base}{out_ext}"
+                augmented.save(target_dir / aug_name, **save_kwargs)
                 count += 1
+                pbar.set_postfix({"generated": count})
+
+        # Write completion marker for idempotency
+        try:
+            marker.write_text(
+                json.dumps(
+                    {
+                        "augmentations_per_image": self.augmentations_per_image,
+                        "save_original": self.save_original,
+                        "output_format": getattr(self, "output_format", "jpg"),
+                        "jpeg_quality": getattr(self, "jpeg_quality", 90),
+                        "seed": self.seed,
+                    },
+                    indent=2,
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write augmentation marker: {e}")
 
         logger.info(
             f"Augmentation of {count} images completed. Output saved to: {output_dir}"
